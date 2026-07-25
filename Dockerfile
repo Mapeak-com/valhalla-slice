@@ -7,14 +7,14 @@ WORKDIR /app
 
 RUN pip install --no-cache-dir docopt fastapi uvicorn mercantile
 
-COPY valhalla_slice /app/valhalla_slice
+COPY valhalla-slice /app/valhalla-slice
 
-RUN chmod +x /app/valhalla_slice
+RUN chmod +x /app/valhalla-slice
 
 RUN mkdir /valhalla
 
 EXPOSE 8000
 
-ENTRYPOINT ["/app/valhalla_slice"]
+ENTRYPOINT ["/app/valhalla-slice"]
 
 CMD ["--tar=/valhalla/valhalla_tiles.tar"]
