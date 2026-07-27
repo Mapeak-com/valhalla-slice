@@ -2,13 +2,14 @@
 """
 Valhalla TAR slicing service.
 Usage:
-  valhalla-slice [--tar=<tar>] [--port=<port>]
+  valhalla-slice [--tar=<tar>] [--port=<port>] [--quiet | -q]
   valhalla-slice -h | --help
 
 Options:
   -h --help      Show this screen.
   --tar=<tar>    Path to valhalla_tiles.tar [default: valhalla_tiles.tar].
   --port=<port>  Port to run the server on [default: 8000].
+  -q --quiet     Disable verbose logging.
 """
 import os
 import time
@@ -35,36 +36,60 @@ uvicorn = ensure_package("uvicorn")
 mercantile = ensure_package("mercantile")
 from fastapi.responses import StreamingResponse
 
+def get_tile_path(tile_id):
+  """Converts a Valhalla GraphId into its tar file path representation."""
+  level = tile_id & 7
+  tile_index = (tile_id >> 3) & 0x3FFFFF
+  if level == 2:
+    return f"{level}/{tile_index // 1000000:03d}/{(tile_index // 1000) % 1000:03d}/{tile_index % 1000:03d}.gph"
+  return f"{level}/{tile_index // 1000:03d}/{tile_index % 1000:03d}.gph"
+
 class ArchiveState:
   """Manages a thread-safe reference-counted file descriptor and index."""
 
-  def __init__(self, tar_path):
+  def __init__(self, tar_path, verbose=True):
     """Initializes the archive state."""
+    self.verbose = verbose
     self.fd = open(tar_path, "rb")
     self.inode = os.fstat(self.fd.fileno()).st_ino
+    self.index_info = {}
     self.index = self._load_index()
     self.ref_count = 0
     self.retired = False
     self.lock = threading.Lock()
+    if self.verbose:
+      print(f"ArchiveState initialized: {len(self.index)} tiles loaded from {tar_path}")
+      sample_keys = [get_tile_path(k) for k in list(self.index.keys())[:5]]
+      print(f"Sample index tile_ids: {sample_keys}")
 
   def _load_index(self):
     """Parses the Valhalla index.bin file from within the tar into a dictionary."""
     index_map = {}
     fd_copy = os.dup(self.fd.fileno())
     os.lseek(fd_copy, 0, os.SEEK_SET)
+    found_index = False
     with os.fdopen(fd_copy, "rb") as f_copy:
       with tarfile.open(fileobj=f_copy, mode="r") as tar:
         for member in tar.getmembers():
           if member.name == "index.bin":
+            found_index = True
+            # offset_data - 512 reliably points to the 512-byte header block
+            self.index_info = {
+                "size": member.size, 
+                "mtime": member.mtime,
+                "header_offset": member.offset_data - 512
+            }
+            if self.verbose:
+              print(f"Located index.bin: {member.size} bytes")
             f = tar.extractfile(member)
             file_size = member.size
             for _ in range(file_size // 16):
               chunk = f.read(16)
-              tile_id = struct.unpack("<Q", chunk[0:8])[0]
-              offset = struct.unpack("<I", chunk[8:12])[0]
-              length = struct.unpack("<I", chunk[12:16])[0]
+              offset, tile_id, length = struct.unpack("<QLL", chunk)
               index_map[tile_id] = {"offset": offset, "length": length}
             break
+    if self.verbose and not found_index:
+      print("WARNING: index.bin not found inside the TAR archive. Index is empty.")
     return index_map
 
   def acquire(self):
@@ -90,10 +115,11 @@ class ArchiveState:
 class StateManager:
   """Manages hot-reloading of the archive state using inode polling."""
 
-  def __init__(self, tar_path):
+  def __init__(self, tar_path, verbose=True):
     """Initializes the state manager and polling thread."""
     self.tar_path = tar_path
-    self.current_state = ArchiveState(tar_path)
+    self.verbose = verbose
+    self.current_state = ArchiveState(tar_path, verbose=self.verbose)
     self.active_inode = self.current_state.inode
     self.swap_lock = threading.Lock()
     threading.Thread(target=self._poll_inode, daemon=True).start()
@@ -119,114 +145,153 @@ class StateManager:
   def _reload(self):
     """Swaps the current state with a newly loaded one."""
     try:
-      new_state = ArchiveState(self.tar_path)
+      new_state = ArchiveState(self.tar_path, verbose=self.verbose)
     except (FileNotFoundError, tarfile.TarError, OSError) as e:
-      print(f"Failed to reload archive state: {e}", file=sys.stderr)
+      if self.verbose:
+        print(f"Failed to reload archive state: {e}", file=sys.stderr)
       return
-
     with self.swap_lock:
       old_state = self.current_state
       self.current_state = new_state
       self.active_inode = new_state.inode
+      if self.verbose:
+        print(f"Hot-reload complete. New inode: {self.active_inode}")
     old_state.retire()
 
 def get_valhalla_tile_ids(z, x, y):
   """
   Calculates intersecting Valhalla GraphIDs (tile IDs) for a given Z, X, Y map tile.
   
-  Valhalla uses a 64-bit GraphId where bits 0-2 represent the hierarchy level,
-  and bits 3-24 represent the tile index. The tile index is calculated using a
-  regular grid of varying sizes per level (Level 0: 4 degrees, Level 1: 1 degree, Level 2: 0.25 degrees).
+  Valhalla 32-bit packed GraphId bit alignment:
+    - Level: bits 0-2
+    - Tile Index: bits 3-24
   """
   bounds = mercantile.bounds(x, y, z)
   west_dec = Decimal(str(bounds.west))
   south_dec = Decimal(str(bounds.south))
   east_dec = Decimal(str(bounds.east))
   north_dec = Decimal(str(bounds.north))
-  
   offset_lon = Decimal("180.0")
   offset_lat = Decimal("90.0")
-
   levels = [
     (0, "4.0"),
     (1, "1.0"),
     (2, "0.25")
   ]
-
   tile_ids = []
-
   for level_info in levels:
     level = level_info[0]
     size_str = level_info[1]
     size_dec = Decimal(size_str)
-    
     cols = int(Decimal("360.0") / size_dec)
     rows = int(Decimal("180.0") / size_dec)
-    
     min_col = max(0, int((west_dec + offset_lon) / size_dec))
-    # Aligns exact coordinate bounds to the lower grid cell index to prevent adjacent tile fetching
     max_col = min(cols - 1, int(math.ceil((east_dec + offset_lon) / size_dec)) - 1)
-    
     min_row = max(0, int((south_dec + offset_lat) / size_dec))
     max_row = min(rows - 1, int(math.ceil((north_dec + offset_lat) / size_dec)) - 1)
-
     for row in range(min_row, max_row + 1):
       for col in range(min_col, max_col + 1):
         tile_index = (row * cols) + col
         graph_id = (tile_index << 3) | level
         tile_ids.append(graph_id)
-
   return tile_ids
 
-def create_tar_header(filename, file_size):
-  """Creates a POSIX-compliant 512-byte TAR header."""
-  filename_bytes = filename.encode("utf-8")
-  header = bytearray(512)
-  header[0:len(filename_bytes)] = filename_bytes
-  size_oct = oct(file_size)[2:].zfill(11).encode("utf-8")
-  header[124:135] = size_oct
-  header[135] = 32
-  header[148:156] = b"        "
-  header[156] = 48
-  magic = b"ustar  \0"
-  header[257:265] = magic
-  checksum = sum(header)
-  chksum_oct = oct(checksum)[2:].zfill(6).encode("utf-8")
-  header[148:154] = chksum_oct
-  header[154] = 0
-  header[155] = 32
-  return bytes(header)
-
-def generate_tar_stream(state, z, x, y):
-  """Yields bytes representing a dynamic TAR archive of the requested tiles."""
+def generate_tar_stream(state, z, x, y, verbose=True):
+  """Yields bytes representing a dynamic TAR archive of the requested tiles, including an updated index.bin."""
   try:
     tile_ids = get_valhalla_tile_ids(z, x, y)
-    for tile_id in tile_ids:
-      if tile_id in state.index:
-        tile_info = state.index[tile_id]
-        offset = tile_info["offset"]
-        length = tile_info["length"]
-        filename = f"{tile_id}.gph"
-        header = create_tar_header(filename, length)
-        yield header
-        
-        bytes_read = 0
-        while bytes_read < length:
-          read_size = length - bytes_read
-          chunk = os.pread(state.fd.fileno(), read_size, offset + bytes_read)
-          if not chunk:
-            break
-          yield chunk
-          chunk_len = len(chunk)
-          bytes_read += chunk_len
-          
-        padding_len = (512 - (length % 512)) % 512
-        if padding_len > 0:
-          padding = b"\0" * padding_len
-          yield padding
-          
+    found_tiles = [t for t in tile_ids if t in state.index]
+    if verbose:
+      print(f"Streaming request for z={z}, x={x}, y={y}. Requires {len(tile_ids)} tiles.")
+      sample_requested = [get_tile_path(t) for t in found_tiles[:5]]
+      print(f"Sample requested tile_ids: {sample_requested}")
+    # 1. Dynamically calculate the new index.bin contents and offsets for this slice
+    index_size = len(found_tiles) * 16
+    index_padding_len = (512 - (index_size % 512)) % 512
+    index_block_size = 512 + index_size + index_padding_len
+    if state.index_info and "header_offset" in state.index_info:
+      orig_idx_header = os.pread(state.fd.fileno(), 512, state.index_info["header_offset"])
+      header = bytearray(orig_idx_header)
+      # Patch the file size (bytes 124-135)
+      size_oct = oct(index_size)[2:].zfill(11).encode("utf-8")
+      header[124:135] = size_oct
+      header[135] = 32
+      # Patch the modification time to now (bytes 136-147)
+      current_time = int(time.time())
+      mtime_oct = oct(current_time)[2:].zfill(11).encode("utf-8")
+      header[136:147] = mtime_oct
+      header[147] = 32
+      # Clear checksum area (bytes 148-155) to recalculate
+      header[148:156] = b"        "
+      checksum = sum(header)
+      chksum_oct = oct(checksum)[2:].zfill(6).encode("utf-8")
+      # Insert new checksum
+      header[148:154] = chksum_oct
+      header[154] = 0
+      header[155] = 32
+      yield bytes(header)
+    # 2. Build and yield the index.bin body
+    current_tar_offset = index_block_size
+    index_bytes = bytearray()
+    for tile_id in found_tiles:
+      length = state.index[tile_id]["length"]
+      content_offset = current_tar_offset + 512  # Account for this tile's 512-byte header
+      index_bytes.extend(struct.pack("<QLL", content_offset, tile_id, length))
+      # Advance the tracker for the next tile
+      tile_padding_len = (512 - (length % 512)) % 512
+      current_tar_offset += 512 + length + tile_padding_len
+    yield bytes(index_bytes)
+    if index_padding_len > 0:
+      yield b"\0" * index_padding_len
+    # 3. Stream the requested graph tiles using original file headers
+    found_count = 0
+    for tile_id in found_tiles:
+      found_count += 1
+      tile_info = state.index[tile_id]
+      offset = tile_info["offset"]
+      length = tile_info["length"]
+      header = os.pread(state.fd.fileno(), 512, offset - 512)
+      yield header
+      bytes_read = 0
+      while bytes_read < length:
+        read_size = length - bytes_read
+        chunk = os.pread(state.fd.fileno(), read_size, offset + bytes_read)
+        if not chunk:
+          break
+        yield chunk
+        bytes_read += len(chunk)
+      padding_len = (512 - (length % 512)) % 512
+      if padding_len > 0:
+        yield b"\0" * padding_len
+    if verbose:
+      print(f"Successfully streamed {found_count} tiles out of {len(tile_ids)} required")
     eof_marker = b"\0" * 1024
     yield eof_marker
+  finally:
+    state.release()
+
+def generate_list_stream(state):
+  """Yields a text representation of the tar contents based on the index."""
+  try:
+    tar_stat = os.stat(state.fd.name)
+    if hasattr(state, "index_info") and state.index_info:
+      idx_size = state.index_info.get("size", 0)
+      idx_time = state.index_info.get("mtime", tar_stat.st_mtime)
+      idx_date = time.strftime("%Y-%m-%d %H:%M", time.localtime(idx_time))
+      yield f"-rw-r--r-- {'0/0':<13} {idx_size:>8} {idx_date} index.bin\n"
+    sorted_items = sorted(state.index.items(), key=lambda x: x[1]["offset"])
+    for tile_id, info in sorted_items:
+      path = get_tile_path(tile_id)
+      length = info["length"]
+      offset = info["offset"]
+      header = os.pread(state.fd.fileno(), 512, offset - 512)
+      try:
+        mtime_octal = header[136:148].decode("utf-8").strip("\x00 ")
+        mtime = int(mtime_octal, 8)
+        gph_date = time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime))
+      except (ValueError, UnicodeDecodeError):
+        gph_date = time.strftime("%Y-%m-%d %H:%M", time.localtime(tar_stat.st_mtime))
+      yield f"-rw-r--r-- {'ubuntu/ubuntu':<13} {length:>8} {gph_date} {path}\n"
   finally:
     state.release()
 
@@ -236,8 +301,9 @@ def main():
   tar_path = args["--tar"]
   port_str = args["--port"]
   port = int(port_str)
+  verbose_flag = not bool(args["--quiet"])
   global state_manager
-  state_manager = StateManager(tar_path)
+  state_manager = StateManager(tar_path, verbose=verbose_flag)
   uvicorn.run(app, host="0.0.0.0", port=port)
 
 app = fastapi.FastAPI()
@@ -246,7 +312,13 @@ app = fastapi.FastAPI()
 def get_tar(z: int, x: int, y: int):
   """HTTP endpoint to stream the generated TAR archive."""
   state = state_manager.get_state()
-  return StreamingResponse(generate_tar_stream(state, z, x, y), media_type="application/x-tar")
+  return StreamingResponse(generate_tar_stream(state, z, x, y, state.verbose), media_type="application/x-tar")
+
+@app.get("/list")
+def list_tar():
+  """HTTP endpoint to list the contents of the TAR archive based on the index."""
+  state = state_manager.get_state()
+  return StreamingResponse(generate_list_stream(state), media_type="text/plain")
 
 if __name__ == "__main__":
   main()
