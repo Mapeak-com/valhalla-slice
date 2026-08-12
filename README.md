@@ -2,6 +2,14 @@
 
 A high-performance Python microservice designed to stream Valhalla planetary routing tiles as TAR archives based on MapLibre Z, X, Y coordinates.
 
+## HTTP endpoints
+
+### `/valhalla-{z}-{x}-{y}.tar`
+Stream a valhalla TAR archive containing all the Valhalla slices required to cover the OSM Z/X/Y tile.
+
+### `/list`
+List the contents of the source Valhalla TAR archive. Mainly for debug purposes.
+
 ## Architecture & Features
 
 * **High-Performance Streaming:** Extracts and serves routing tiles directly from an uncompressed Valhalla `.tar` archive.
