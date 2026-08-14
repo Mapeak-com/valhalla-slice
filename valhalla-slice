@@ -196,20 +196,33 @@ def get_valhalla_tile_ids(z, x, y):
         tile_ids.append(graph_id)
   return tile_ids
 
-def generate_tar_stream(state, z, x, y, verbose=True):
-  """Yields bytes representing a dynamic TAR archive of the requested tiles, including an updated index.bin."""
+def has_index_header(state):
+  """Whether an original index.bin TAR header exists to be patched and re-emitted."""
+  return bool(state.index_info and "header_offset" in state.index_info)
+
+def compute_tar_size(state, found_tiles):
+  """Computes the exact byte size of the TAR archive generate_tar_stream will produce for found_tiles."""
+  index_size = len(found_tiles) * 16
+  index_padding_len = (512 - (index_size % 512)) % 512
+  total = (512 if has_index_header(state) else 0) + index_size + index_padding_len
+  for tile_id in found_tiles:
+    length = state.index[tile_id]["length"]
+    tile_padding_len = (512 - (length % 512)) % 512
+    total += 512 + length + tile_padding_len
+  total += 1024  # EOF marker
+  return total
+
+def generate_tar_stream(state, found_tiles, verbose=True):
+  """Yields bytes representing a dynamic TAR archive of found_tiles, including an updated index.bin."""
   try:
-    tile_ids = get_valhalla_tile_ids(z, x, y)
-    found_tiles = [t for t in tile_ids if t in state.index]
     if verbose:
-      print(f"Streaming request for z={z}, x={x}, y={y}. Requires {len(tile_ids)} tiles.")
       sample_requested = [get_tile_path(t) for t in found_tiles[:5]]
       print(f"Sample requested tile_ids: {sample_requested}")
     # 1. Dynamically calculate the new index.bin contents and offsets for this slice
     index_size = len(found_tiles) * 16
     index_padding_len = (512 - (index_size % 512)) % 512
     index_block_size = 512 + index_size + index_padding_len
-    if state.index_info and "header_offset" in state.index_info:
+    if has_index_header(state):
       orig_idx_header = os.pread(state.fd.fileno(), 512, state.index_info["header_offset"])
       header = bytearray(orig_idx_header)
       # Patch the file size (bytes 124-135)
@@ -264,7 +277,7 @@ def generate_tar_stream(state, z, x, y, verbose=True):
       if padding_len > 0:
         yield b"\0" * padding_len
     if verbose:
-      print(f"Successfully streamed {found_count} tiles out of {len(tile_ids)} required")
+      print(f"Successfully streamed {found_count} tiles")
     eof_marker = b"\0" * 1024
     yield eof_marker
   finally:
@@ -322,7 +335,16 @@ async def log_requests(request: fastapi.Request, call_next):
 def get_tar(z: int, x: int, y: int):
   """HTTP endpoint to stream the generated TAR archive."""
   state = state_manager.get_state()
-  return StreamingResponse(generate_tar_stream(state, z, x, y, state.verbose), media_type="application/x-tar")
+  tile_ids = get_valhalla_tile_ids(z, x, y)
+  found_tiles = [t for t in tile_ids if t in state.index]
+  if state.verbose:
+    print(f"Streaming request for z={z}, x={x}, y={y}. Requires {len(tile_ids)} tiles.")
+  total_size = compute_tar_size(state, found_tiles)
+  return StreamingResponse(
+    generate_tar_stream(state, found_tiles, state.verbose),
+    media_type="application/x-tar",
+    headers={"Content-Length": str(total_size)},
+  )
 
 @app.get("/list")
 def list_tar():
