@@ -4,7 +4,7 @@ A high-performance Python microservice designed to stream Valhalla planetary rou
 
 ## HTTP endpoints
 
-### `/valhalla-{z}-{x}-{y}.tar`
+### `/valhalla+{z}-{x}-{y}.tar`
 Stream a valhalla TAR archive containing all the Valhalla slices required to cover the OSM Z/X/Y tile.
 
 ### `/list`

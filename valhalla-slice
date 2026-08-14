@@ -308,7 +308,7 @@ def main():
 
 app = fastapi.FastAPI()
 
-@app.get("/valhalla-{z}-{x}-{y}.tar")
+@app.get("/valhalla+{z}-{x}-{y}.tar")
 def get_tar(z: int, x: int, y: int):
   """HTTP endpoint to stream the generated TAR archive."""
   state = state_manager.get_state()
