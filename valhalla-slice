@@ -20,6 +20,7 @@ import sys
 import importlib
 import tarfile
 import math
+import zlib
 from decimal import Decimal
 
 def ensure_package(package_name):
@@ -283,6 +284,15 @@ def generate_tar_stream(state, found_tiles, verbose=True):
   finally:
     state.release()
 
+def generate_tgz_stream(state, found_tiles, verbose=True):
+  """Yields bytes representing a dynamic GZIP-compressed TAR archive."""
+  compressor = zlib.compressobj(wbits=31)
+  for chunk in generate_tar_stream(state, found_tiles, verbose):
+    compressed_chunk = compressor.compress(chunk)
+    if compressed_chunk:
+      yield compressed_chunk
+  yield compressor.flush()
+
 def generate_list_stream(state):
   """Yields a text representation of the tar contents based on the index."""
   try:
@@ -331,20 +341,35 @@ async def log_requests(request: fastapi.Request, call_next):
     print(f'{client_addr} - "{request.method} {request.url.path} HTTP/{http_version}" {response.status_code}')
   return response
 
-@app.get("/valhalla+{z}-{x}-{y}.tar")
-def get_tar(z: int, x: int, y: int):
-  """HTTP endpoint to stream the generated TAR archive."""
+def _prepare_archive_stream(z: int, x: int, y: int, is_tgz: bool):
+  """Helper to process map tile requests and return the appropriate streaming response."""
   state = state_manager.get_state()
   tile_ids = get_valhalla_tile_ids(z, x, y)
   found_tiles = [t for t in tile_ids if t in state.index]
+  ext = "tgz" if is_tgz else "tar"
   if state.verbose:
-    print(f"Streaming request for z={z}, x={x}, y={y}. Requires {len(tile_ids)} tiles.")
+    print(f"Streaming {ext} request for z={z}, x={x}, y={y}. Requires {len(tile_ids)} tiles.")
+  if is_tgz:
+    return StreamingResponse(
+      generate_tgz_stream(state, found_tiles, state.verbose),
+      media_type="application/gzip",
+    )
   total_size = compute_tar_size(state, found_tiles)
   return StreamingResponse(
     generate_tar_stream(state, found_tiles, state.verbose),
     media_type="application/x-tar",
     headers={"Content-Length": str(total_size)},
   )
+
+@app.get("/valhalla+{z}-{x}-{y}.tar")
+def get_tar(z: int, x: int, y: int):
+  """HTTP endpoint to stream the generated TAR archive."""
+  return _prepare_archive_stream(z, x, y, is_tgz=False)
+
+@app.get("/valhalla-{z}-{x}-{y}.tgz")
+def get_tgz(z: int, x: int, y: int):
+  """HTTP endpoint to stream the generated TAR archive compressed with GZIP."""
+  return _prepare_archive_stream(z, x, y, is_tgz=True)
 
 @app.get("/list")
 def list_tar():
