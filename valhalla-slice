@@ -366,7 +366,7 @@ def get_tar(z: int, x: int, y: int):
   """HTTP endpoint to stream the generated TAR archive."""
   return _prepare_archive_stream(z, x, y, is_tgz=False)
 
-@app.get("/valhalla-{z}-{x}-{y}.tgz")
+@app.get("/valhalla+{z}-{x}-{y}.tgz")
 def get_tgz(z: int, x: int, y: int):
   """HTTP endpoint to stream the generated TAR archive compressed with GZIP."""
   return _prepare_archive_stream(z, x, y, is_tgz=True)
