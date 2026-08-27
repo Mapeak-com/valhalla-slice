@@ -202,18 +202,6 @@ def has_index_header(state):
   """Whether an original index.bin TAR header exists to be patched and re-emitted."""
   return bool(state.index_info and "header_offset" in state.index_info)
 
-def compute_tar_size(state, found_tiles):
-  """Computes the exact byte size of the TAR archive generate_tar_stream will produce for found_tiles."""
-  index_size = len(found_tiles) * 16
-  index_padding_len = (512 - (index_size % 512)) % 512
-  total = (512 if has_index_header(state) else 0) + index_size + index_padding_len
-  for tile_id in found_tiles:
-    length = state.index[tile_id]["length"]
-    tile_padding_len = (512 - (length % 512)) % 512
-    total += 512 + length + tile_padding_len
-  total += 1024  # EOF marker
-  return total
-
 def generate_tar_stream(state, found_tiles, verbose=True):
   """Yields bytes representing a dynamic TAR archive of found_tiles, including an updated index.bin."""
   try:
@@ -353,42 +341,25 @@ def stream_file_and_close(temp_file):
   finally:
     temp_file.close()
 
-def _prepare_archive_stream(z: int, x: int, y: int, is_tgz: bool):
-  """Helper to process map tile requests and return the appropriate streaming response."""
-  state = state_manager.get_state()
-  tile_ids = get_valhalla_tile_ids(z, x, y)
-  found_tiles = [t for t in tile_ids if t in state.index]
-  ext = "tgz" if is_tgz else "tar"
-  if state.verbose:
-    print(f"Streaming {ext} request for z={z}, x={x}, y={y}. Requires {len(tile_ids)} tiles.")
-  if is_tgz:
-    max_spool_bytes = 5 * 1024 * 1024
-    temp_file = tempfile.SpooledTemporaryFile(max_size=max_spool_bytes, mode="w+b")
-    for chunk in generate_tgz_stream(state, found_tiles, state.verbose):
-      temp_file.write(chunk)
-    total_size = temp_file.tell()
-    temp_file.seek(0)
-    return StreamingResponse(
-      stream_file_and_close(temp_file),
-      media_type="application/gzip",
-      headers={"Content-Length": str(total_size)},
-    )
-  total_size = compute_tar_size(state, found_tiles)
-  return StreamingResponse(
-    generate_tar_stream(state, found_tiles, state.verbose),
-    media_type="application/x-tar",
-    headers={"Content-Length": str(total_size)},
-  )
-
-@app.get("/valhalla+{z}-{x}-{y}.tar")
-def get_tar(z: int, x: int, y: int):
-  """HTTP endpoint to stream the generated TAR archive."""
-  return _prepare_archive_stream(z, x, y, is_tgz=False)
-
 @app.get("/valhalla+{z}-{x}-{y}.tgz")
 def get_tgz(z: int, x: int, y: int):
   """HTTP endpoint to stream the generated TAR archive compressed with GZIP."""
-  return _prepare_archive_stream(z, x, y, is_tgz=True)
+  state = state_manager.get_state()
+  tile_ids = get_valhalla_tile_ids(z, x, y)
+  found_tiles = [t for t in tile_ids if t in state.index]
+  if state.verbose:
+    print(f"Streaming tgz request for z={z}, x={x}, y={y}. Requires {len(tile_ids)} tiles.")
+  max_spool_bytes = 5 * 1024 * 1024
+  temp_file = tempfile.SpooledTemporaryFile(max_size=max_spool_bytes, mode="w+b")
+  for chunk in generate_tgz_stream(state, found_tiles, state.verbose):
+    temp_file.write(chunk)
+  total_size = temp_file.tell()
+  temp_file.seek(0)
+  return StreamingResponse(
+    stream_file_and_close(temp_file),
+    media_type="application/gzip",
+    headers={"Content-Length": str(total_size)},
+  )
 
 @app.get("/list")
 def list_tar():
