@@ -21,6 +21,7 @@ import importlib
 import tarfile
 import math
 import zlib
+import tempfile
 from decimal import Decimal
 
 def ensure_package(package_name):
@@ -341,6 +342,17 @@ async def log_requests(request: fastapi.Request, call_next):
     print(f'{client_addr} - "{request.method} {request.url.path} HTTP/{http_version}" {response.status_code}')
   return response
 
+def stream_file_and_close(temp_file):
+  """Yields chunks from a temporary file and closes it when done."""
+  try:
+    while True:
+      chunk = temp_file.read(65536)
+      if not chunk:
+        break
+      yield chunk
+  finally:
+    temp_file.close()
+
 def _prepare_archive_stream(z: int, x: int, y: int, is_tgz: bool):
   """Helper to process map tile requests and return the appropriate streaming response."""
   state = state_manager.get_state()
@@ -350,9 +362,16 @@ def _prepare_archive_stream(z: int, x: int, y: int, is_tgz: bool):
   if state.verbose:
     print(f"Streaming {ext} request for z={z}, x={x}, y={y}. Requires {len(tile_ids)} tiles.")
   if is_tgz:
+    max_spool_bytes = 5 * 1024 * 1024
+    temp_file = tempfile.SpooledTemporaryFile(max_size=max_spool_bytes, mode="w+b")
+    for chunk in generate_tgz_stream(state, found_tiles, state.verbose):
+      temp_file.write(chunk)
+    total_size = temp_file.tell()
+    temp_file.seek(0)
     return StreamingResponse(
-      generate_tgz_stream(state, found_tiles, state.verbose),
+      stream_file_and_close(temp_file),
       media_type="application/gzip",
+      headers={"Content-Length": str(total_size)},
     )
   total_size = compute_tar_size(state, found_tiles)
   return StreamingResponse(
