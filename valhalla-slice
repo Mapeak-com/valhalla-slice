@@ -22,6 +22,7 @@ import tarfile
 import math
 import zlib
 import tempfile
+import json
 from decimal import Decimal
 
 def ensure_package(package_name):
@@ -36,7 +37,11 @@ docopt = ensure_package("docopt")
 fastapi = ensure_package("fastapi")
 uvicorn = ensure_package("uvicorn")
 mercantile = ensure_package("mercantile")
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, PlainTextResponse
+from fastapi.concurrency import run_in_threadpool
+
+MAX_POLYGON_BYTES = 64 * 1024 * 1024
+SNAP_EPSILON = 1e-9
 
 def get_tile_path(tile_id):
   """Converts a Valhalla GraphId into its tar file path representation."""
@@ -198,6 +203,215 @@ def get_valhalla_tile_ids(z, x, y):
         tile_ids.append(graph_id)
   return tile_ids
 
+def check_coordinate(lon, lat):
+  """Converts a longitude/latitude pair to floats, rejecting values outside -180..180 / -90..90."""
+  if isinstance(lon, bool) or isinstance(lat, bool):
+    raise ValueError(f"invalid coordinate: {lon} {lat}")
+  try:
+    lon_value = float(lon)
+    lat_value = float(lat)
+  except (TypeError, ValueError):
+    raise ValueError(f"invalid coordinate: {lon} {lat}")
+  if not (-180 <= lon_value <= 180 and -90 <= lat_value <= 90):
+    raise ValueError(f"invalid coordinate: {lon} {lat}")
+  return (lon_value, lat_value)
+
+def normalize_ring(points):
+  """Drops a closing point equal to the first one and requires at least 3 distinct points."""
+  if len(points) > 1 and points[0] == points[-1]:
+    points = points[:-1]
+  if len(set(points)) < 3:
+    raise ValueError("a ring needs at least 3 distinct points")
+  return points
+
+def point_in_ring(point, ring):
+  """Even-odd test of whether a point is inside a ring."""
+  inside = False
+  for i in range(len(ring)):
+    start = ring[i]
+    end = ring[(i + 1) % len(ring)]
+    if (start[1] > point[1]) != (end[1] > point[1]):
+      crossing = start[0] + (point[1] - start[1]) * (end[0] - start[0]) / (end[1] - start[1])
+      if point[0] < crossing:
+        inside = not inside
+  return inside
+
+def parse_geojson_polygon(rings):
+  """Converts GeoJSON Polygon coordinates into a list of rings of (lon, lat) tuples."""
+  if not isinstance(rings, list) or not rings:
+    raise ValueError("invalid polygon coordinates")
+  result = []
+  for ring in rings:
+    if not isinstance(ring, list):
+      raise ValueError("invalid polygon coordinates")
+    points = []
+    for position in ring:
+      if not isinstance(position, list) or len(position) < 2:
+        raise ValueError(f"invalid coordinate: {position}")
+      points.append(check_coordinate(position[0], position[1]))
+    result.append(normalize_ring(points))
+  return result
+
+def parse_geojson(text):
+  """Parses the Polygon and MultiPolygon geometries of a GeoJSON FeatureCollection, Feature or geometry."""
+  try:
+    data = json.loads(text)
+  except ValueError as e:
+    raise ValueError(f"invalid GeoJSON: {e}")
+  polygons = []
+  pending = [data]
+  while pending:
+    obj = pending.pop(0)
+    if not isinstance(obj, dict):
+      raise ValueError("invalid GeoJSON object")
+    kind = obj.get("type")
+    if kind == "FeatureCollection":
+      features = obj.get("features")
+      if not isinstance(features, list):
+        raise ValueError("invalid GeoJSON FeatureCollection")
+      pending.extend(features)
+    elif kind == "Feature":
+      if obj.get("geometry") is not None:
+        pending.append(obj["geometry"])
+    elif kind == "Polygon":
+      polygons.append(parse_geojson_polygon(obj.get("coordinates")))
+    elif kind == "MultiPolygon":
+      coordinates = obj.get("coordinates")
+      if not isinstance(coordinates, list):
+        raise ValueError("invalid MultiPolygon coordinates")
+      for rings in coordinates:
+        polygons.append(parse_geojson_polygon(rings))
+  return polygons
+
+def parse_poly(text):
+  """Parses an Osmosis .poly file; a ring whose header starts with '!' is a hole in each preceding ring that contains it."""
+  lines = text.splitlines()
+  polygons = []
+  i = 1
+  finished = False
+  while i < len(lines):
+    header = lines[i].strip()
+    i += 1
+    if not header:
+      continue
+    if header == "END":
+      finished = True
+      break
+    points = []
+    closed = False
+    while i < len(lines):
+      line = lines[i].strip()
+      i += 1
+      if line == "END":
+        closed = True
+        break
+      if not line:
+        continue
+      parts = line.split()
+      if len(parts) != 2:
+        raise ValueError(f"invalid coordinate on line {i}: {line}")
+      points.append(check_coordinate(parts[0], parts[1]))
+    if not closed:
+      raise ValueError(f"unclosed ring: {header}")
+    ring = normalize_ring(points)
+    if header.startswith("!"):
+      for polygon in polygons:
+        if point_in_ring(ring[0], polygon[0]):
+          polygon.append(ring)
+    else:
+      polygons.append([ring])
+  if not finished:
+    raise ValueError("missing final END")
+  if any(line.strip() for line in lines[i:]):
+    raise ValueError("content after final END")
+  return polygons
+
+def parse_polygon(text):
+  """Parses GeoJSON (first non-space character '{') or Osmosis .poly text into polygons, each a list of rings."""
+  if text.lstrip().startswith("{"):
+    polygons = parse_geojson(text)
+  else:
+    polygons = parse_poly(text)
+  if not polygons:
+    raise ValueError("no polygon geometry")
+  return polygons
+
+def snap(value):
+  """Snaps a value within SNAP_EPSILON of a whole number to that number."""
+  nearest = round(value)
+  if abs(value - nearest) < SNAP_EPSILON:
+    return float(nearest)
+  return value
+
+def add_boundary_cells(ring, cells):
+  """Adds the cells whose interior a ring segment passes through, in fractional cell coordinates."""
+  for i in range(len(ring)):
+    start = ring[i]
+    end = ring[(i + 1) % len(ring)]
+    du = end[0] - start[0]
+    dv = end[1] - start[1]
+    params = {0.0, 1.0}
+    if du != 0:
+      for k in range(math.ceil(min(start[0], end[0])), math.floor(max(start[0], end[0])) + 1):
+        params.add((k - start[0]) / du)
+    if dv != 0:
+      for k in range(math.ceil(min(start[1], end[1])), math.floor(max(start[1], end[1])) + 1):
+        params.add((k - start[1]) / dv)
+    ordered = sorted(t for t in params if 0 <= t <= 1)
+    for j in range(len(ordered) - 1):
+      t = (ordered[j] + ordered[j + 1]) / 2
+      u = snap(start[0] + du * t)
+      v = snap(start[1] + dv * t)
+      if u != math.floor(u) and v != math.floor(v):
+        cells.add((math.floor(u), math.floor(v)))
+
+def add_interior_cells(polygon, cells):
+  """Adds the cells whose center is inside the polygon, using the even-odd rule over all its rings."""
+  rows_v = [point[1] for point in polygon[0]]
+  for row in range(math.floor(min(rows_v)), math.ceil(max(rows_v))):
+    center = row + 0.5
+    crossings = []
+    for ring in polygon:
+      for i in range(len(ring)):
+        start = ring[i]
+        end = ring[(i + 1) % len(ring)]
+        if (start[1] > center) != (end[1] > center):
+          crossings.append(start[0] + (center - start[1]) * (end[0] - start[0]) / (end[1] - start[1]))
+    crossings.sort()
+    for i in range(0, len(crossings) - 1, 2):
+      first_col = math.floor(crossings[i] - 0.5) + 1
+      last_col = math.ceil(crossings[i + 1] - 0.5) - 1
+      for col in range(first_col, last_col + 1):
+        cells.add((col, row))
+
+def get_valhalla_tile_ids_polygon(polygons):
+  """
+  Calculates the Valhalla GraphIDs (tile IDs) of the cells that overlap the polygons, excluding cells that only touch them.
+  A cell overlaps when a ring segment passes through its interior or its center is inside a polygon.
+  """
+  levels = [
+    (0, 4.0),
+    (1, 1.0),
+    (2, 0.25)
+  ]
+  tile_ids = []
+  for level_info in levels:
+    level = level_info[0]
+    size = level_info[1]
+    cols = int(360 / size)
+    rows = int(180 / size)
+    cells = set()
+    for polygon in polygons:
+      grid_polygon = [[(snap((lon + 180) / size), snap((lat + 90) / size)) for lon, lat in ring] for ring in polygon]
+      for ring in grid_polygon:
+        add_boundary_cells(ring, cells)
+      add_interior_cells(grid_polygon, cells)
+    for cell in sorted(cells, key=lambda c: (c[1], c[0])):
+      if 0 <= cell[0] < cols and 0 <= cell[1] < rows:
+        tile_index = (cell[1] * cols) + cell[0]
+        tile_ids.append((tile_index << 3) | level)
+  return tile_ids
+
 def has_index_header(state):
   """Whether an original index.bin TAR header exists to be patched and re-emitted."""
   return bool(state.index_info and "header_offset" in state.index_info)
@@ -341,14 +555,9 @@ def stream_file_and_close(temp_file):
   finally:
     temp_file.close()
 
-@app.get("/valhalla+{z}-{x}-{y}.tgz")
-def get_tgz(z: int, x: int, y: int):
-  """HTTP endpoint to stream the generated TAR archive compressed with GZIP."""
-  state = state_manager.get_state()
-  tile_ids = get_valhalla_tile_ids(z, x, y)
+def build_tgz_response(state, tile_ids, filename):
+  """Builds the GZIP-compressed TAR archive of the indexed tiles among tile_ids and returns it as a download."""
   found_tiles = [t for t in tile_ids if t in state.index]
-  if state.verbose:
-    print(f"Streaming tgz request for z={z}, x={x}, y={y}. Requires {len(tile_ids)} tiles.")
   max_spool_bytes = 5 * 1024 * 1024
   temp_file = tempfile.SpooledTemporaryFile(max_size=max_spool_bytes, mode="w+b")
   for chunk in generate_tgz_stream(state, found_tiles, state.verbose):
@@ -358,8 +567,57 @@ def get_tgz(z: int, x: int, y: int):
   return StreamingResponse(
     stream_file_and_close(temp_file),
     media_type="application/gzip",
-    headers={"Content-Length": str(total_size)},
+    headers={"Content-Length": str(total_size), "Content-Disposition": f"attachment; filename={filename}"},
   )
+
+@app.get("/valhalla+{z}-{x}-{y}.tgz")
+def get_tgz(z: int, x: int, y: int):
+  """HTTP endpoint to stream the generated TAR archive compressed with GZIP."""
+  state = state_manager.get_state()
+  tile_ids = get_valhalla_tile_ids(z, x, y)
+  if state.verbose:
+    print(f"Streaming tgz request for z={z}, x={x}, y={y}. Requires {len(tile_ids)} tiles.")
+  return build_tgz_response(state, tile_ids, f"valhalla+{z}-{x}-{y}.tgz")
+
+def polygon_response(text):
+  """Returns the archive of the tiles covered by a GeoJSON or .poly polygon, or 400 when it does not parse."""
+  try:
+    polygons = parse_polygon(text)
+  except ValueError as e:
+    return PlainTextResponse(f"{e}\n", status_code=400)
+  tile_ids = get_valhalla_tile_ids_polygon(polygons)
+  state = state_manager.get_state()
+  if state.verbose:
+    print(f"Streaming tgz request for a polygon. Requires {len(tile_ids)} tiles.")
+  return build_tgz_response(state, tile_ids, "valhalla.tgz")
+
+@app.get("/valhalla.tgz")
+def get_polygon_tgz(request: fastapi.Request):
+  """HTTP endpoint for the archive of the tiles covered by the URL-encoded polygon parameter."""
+  polygons = request.query_params.getlist("polygon")
+  if len(polygons) > 1:
+    return PlainTextResponse("polygon given more than once\n", status_code=400)
+  if not polygons or not polygons[0].strip():
+    return PlainTextResponse("missing polygon\n", status_code=400)
+  return polygon_response(polygons[0])
+
+@app.post("/valhalla.tgz")
+async def post_polygon_tgz(request: fastapi.Request):
+  """HTTP endpoint for the archive of the tiles covered by the polygon in the raw request body."""
+  if "polygon" in request.query_params:
+    return PlainTextResponse("POST takes the polygon in the body, not the polygon parameter\n", status_code=400)
+  body = bytearray()
+  async for chunk in request.stream():
+    body.extend(chunk)
+    if len(body) > MAX_POLYGON_BYTES:
+      return PlainTextResponse(f"polygon larger than {MAX_POLYGON_BYTES} bytes\n", status_code=413)
+  try:
+    text = body.decode("utf-8")
+  except UnicodeDecodeError:
+    return PlainTextResponse("polygon is not UTF-8 text\n", status_code=400)
+  if not text.strip():
+    return PlainTextResponse("missing polygon\n", status_code=400)
+  return await run_in_threadpool(polygon_response, text)
 
 @app.get("/list")
 def list_tar():
