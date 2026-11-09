@@ -31,6 +31,7 @@ vs.ensure_package("shapely")
 vs.ensure_package("httpx2")
 from shapely.geometry import Polygon, box
 from fastapi.testclient import TestClient
+import anyio
 
 LEVELS = [(0, 4.0), (1, 1.0), (2, 0.25)]
 ARCHIVE_AREA = (34.0, 29.0, 36.0, 33.5)
@@ -118,11 +119,12 @@ def add_member(tar, name, data, mtime=TILE_MTIME):
   info.mtime = mtime
   tar.addfile(info, io.BytesIO(data))
 
-def build_archive(path, tile_ids, with_index=True, large_mtime_tile=None):
-  """Writes a Valhalla tile archive: index.bin followed by one .gph member per tile; returns the tile contents."""
-  contents = {}
-  for tile_id in tile_ids:
-    contents[tile_id] = tile_id.to_bytes(4, "little") * ((tile_id % 300) + 1)
+def build_archive(path, tile_ids, with_index=True, large_mtime_tile=None, contents=None):
+  """Writes a Valhalla tile archive: index.bin followed by one .gph member per tile, with generated or given contents; returns the tile contents."""
+  if contents is None:
+    contents = {}
+    for tile_id in tile_ids:
+      contents[tile_id] = tile_id.to_bytes(4, "little") * ((tile_id % 300) + 1)
   paths = {vs.get_tile_path(t): t for t in tile_ids}
   offsets = {t: 0 for t in tile_ids}
   tar_format = tarfile.GNU_FORMAT if large_mtime_tile else tarfile.USTAR_FORMAT
@@ -139,9 +141,8 @@ def build_archive(path, tile_ids, with_index=True, large_mtime_tile=None):
           offsets[paths[member.name]] = member.offset_data
   return contents
 
-def read_tgz(data):
-  """Returns the members of a .tgz response, checking that index.bin points at each tile's data."""
-  raw = gzip.decompress(data)
+def read_tar(raw):
+  """Returns the members of a .tar response, checking that index.bin points at each tile's data."""
   with tarfile.open(fileobj=io.BytesIO(raw)) as tar:
     members = {m.name: tar.extractfile(m).read() for m in tar.getmembers()}
   index = members["index.bin"]
@@ -149,6 +150,16 @@ def read_tgz(data):
     record = struct.unpack("<QLL", index[i:i + 16])
     assert raw[record[0]:record[0] + record[2]] == members[vs.get_tile_path(record[1])]
   return members
+
+def read_tgz(data):
+  """Returns the members of a .tgz response, checking that index.bin points at each tile's data."""
+  return read_tar(gzip.decompress(data))
+
+def tar_bytes(response):
+  """Returns the uncompressed TAR archive of a .tar or .tgz response."""
+  if response.headers["content-type"] == "application/gzip":
+    return gzip.decompress(response.content)
+  return response.content
 
 @pytest.fixture(scope="module")
 def service(tmp_path_factory):
@@ -298,6 +309,70 @@ def test_tile_endpoint(service):
   assert expected
   assert sorted(members) == sorted(["index.bin"] + expected)
 
+@pytest.mark.parametrize("method,name,params,body", [
+  ("GET", "valhalla+7-76-52", None, None),
+  ("GET", "valhalla", {"polygon": triangle_geojson()}, None),
+  ("POST", "valhalla", None, triangle_poly()),
+])
+def test_tar_endpoints(service, method, name, params, body):
+  """Each .tar endpoint returns the tiles and index of its .tgz endpoint uncompressed, with a Content-Length that matches its body."""
+  client = service[0]
+  tar_response = client.request(method, f"/{name}.tar", params=params, content=body)
+  tgz_response = client.request(method, f"/{name}.tgz", params=params, content=body)
+  assert tar_response.status_code == 200
+  assert tar_response.headers["content-type"] == "application/x-tar"
+  assert tar_response.headers["content-disposition"] == f"attachment; filename={name}.tar"
+  assert int(tar_response.headers["content-length"]) == len(tar_response.content)
+  assert read_tar(tar_response.content) == read_tgz(tgz_response.content)
+
+def test_tar_streams_before_second_tile(service, monkeypatch):
+  """The .tar response sends its Content-Length and first byte before the second tile's header or data is read, and stops there."""
+  state = vs.state_manager.current_state
+  found_tiles = [t for t in vs.get_valhalla_tile_ids(7, 76, 52) if t in state.index]
+  second_offset = state.index[found_tiles[1]]["offset"]
+  events = []
+  real_pread = os.pread
+
+  class SecondTileRead(Exception):
+    """Ends the response at the first read of the second tile."""
+
+  def recording_pread(fd, length, offset):
+    """Records the first read of the second tile's header or data and ends the response there."""
+    if offset in (second_offset - 512, second_offset):
+      events.append("second tile read")
+      raise SecondTileRead()
+    return real_pread(fd, length, offset)
+
+  async def receive():
+    """Returns an empty request body."""
+    return {"type": "http.request", "body": b"", "more_body": False}
+
+  async def send(message):
+    """Records the response start with its Content-Length and the first body byte."""
+    if message["type"] == "http.response.start":
+      events.append(("start", dict(message["headers"]).get(b"content-length")))
+    elif message.get("body") and "first byte" not in events:
+      events.append("first byte")
+  monkeypatch.setattr(vs.os, "pread", recording_pread)
+  scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": "2.4"}, "http_version": "1.1", "method": "GET", "scheme": "http", "path": "/valhalla+7-76-52.tar", "raw_path": b"/valhalla+7-76-52.tar", "root_path": "", "query_string": b"", "headers": [], "client": None, "server": ("testserver", 80)}
+  with pytest.raises(SecondTileRead):
+    anyio.run(vs.app, scope, receive, send)
+  assert len(found_tiles) > 1
+  assert events == [("start", str(vs.tar_size(state, found_tiles)).encode()), "first byte", "second tile read"]
+
+@pytest.mark.parametrize("lengths", [[], [0], [512, 1024], [511, 512, 513], [100] * 32, [1] * 33])
+def test_tar_size(tmp_path, lengths):
+  """tar_size is the number of bytes generate_tar_stream yields, whether or not the tiles and index.bin need padding."""
+  tile_ids = archive_tile_ids()[:len(lengths)]
+  path = str(tmp_path / "valhalla_tiles.tar")
+  build_archive(path, tile_ids, contents={t: b"x" * n for t, n in zip(tile_ids, lengths)})
+  state = vs.ArchiveState(path, verbose=False)
+  state.acquire()
+  size = vs.tar_size(state, tile_ids)
+  assert size == len(b"".join(vs.generate_tar_stream(state, tile_ids, verbose=False)))
+  state.fd.close()
+
+@pytest.mark.parametrize("ext", ["tgz", "tar"])
 @pytest.mark.parametrize("method,url,body,status", [
   ("GET", "/valhalla.tgz", None, 400),
   ("GET", "/valhalla.tgz?polygon=", None, 400),
@@ -309,31 +384,33 @@ def test_tile_endpoint(service):
   ("POST", "/valhalla.tgz?polygon=x", square_poly().encode(), 400),
   ("POST", "/valhalla.tgz", b"name\n1\n0 0\n", 400),
 ])
-def test_http_errors(service, method, url, body, status):
+def test_http_errors(service, ext, method, url, body, status):
   """Missing, repeated, misplaced and invalid polygons are rejected."""
-  response = service[0].request(method, url, content=body)
+  response = service[0].request(method, url.replace(".tgz", f".{ext}"), content=body)
   assert response.status_code == status
 
-def test_post_too_large(service, monkeypatch):
+@pytest.mark.parametrize("ext", ["tgz", "tar"])
+def test_post_too_large(service, monkeypatch, ext):
   """A body over MAX_POLYGON_BYTES is rejected with 413."""
   monkeypatch.setattr(vs, "MAX_POLYGON_BYTES", 10)
-  response = service[0].post("/valhalla.tgz", content=square_poly())
+  response = service[0].post(f"/valhalla.{ext}", content=square_poly())
   assert response.status_code == 413
 
-def read_tgz_infos(data):
-  """Returns the TarInfo of each member of a .tgz response by name."""
-  with tarfile.open(fileobj=io.BytesIO(gzip.decompress(data))) as tar:
+def read_tar_infos(raw):
+  """Returns the TarInfo of each member of an uncompressed archive by name."""
+  with tarfile.open(fileobj=io.BytesIO(raw)) as tar:
     return {m.name: m for m in tar.getmembers()}
 
 def list_date(mtime):
   """Formats a modification time as the /list endpoint does."""
   return time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime))
 
-def test_archive_header_times(service):
+@pytest.mark.parametrize("ext", ["tgz", "tar"])
+def test_archive_header_times(service, ext):
   """Tiles keep the mtime of their original headers and the generated index.bin gets the current time."""
   start = int(time.time())
-  response = service[0].get("/valhalla+7-76-52.tgz")
-  infos = read_tgz_infos(response.content)
+  response = service[0].get(f"/valhalla+7-76-52.{ext}")
+  infos = read_tar_infos(tar_bytes(response))
   assert start <= infos["index.bin"].mtime <= int(time.time())
   assert infos["index.bin"].size == 16 * (len(infos) - 1)
   assert all(info.mtime == TILE_MTIME for name, info in infos.items() if name != "index.bin")
@@ -369,8 +446,12 @@ def test_archive_without_index(tmp_path, monkeypatch, capsys):
   response = client.get("/valhalla+7-76-52.tgz")
   assert response.status_code == 200
   assert gzip.decompress(response.content) == b"\0" * 1024
+  response = client.get("/valhalla+7-76-52.tar")
+  assert response.content == b"\0" * 1024
+  assert response.headers["content-length"] == "1024"
 
-def test_truncated_tile_data(tmp_path, monkeypatch):
+@pytest.mark.parametrize("ext", ["tgz", "tar"])
+def test_truncated_tile_data(tmp_path, monkeypatch, ext):
   """A tile whose data was cut off after loading ends its data early instead of hanging."""
   path = str(tmp_path / "valhalla_tiles.tar")
   build_archive(path, archive_tile_ids())
@@ -378,12 +459,12 @@ def test_truncated_tile_data(tmp_path, monkeypatch):
   monkeypatch.setattr(vs, "state_manager", manager)
   area = "\n".join(["area", "1", f"{ARCHIVE_AREA[0]} {ARCHIVE_AREA[1]}", f"{ARCHIVE_AREA[2]} {ARCHIVE_AREA[1]}", f"{ARCHIVE_AREA[2]} {ARCHIVE_AREA[3]}", f"{ARCHIVE_AREA[0]} {ARCHIVE_AREA[3]}", "END", "END"])
   client = TestClient(vs.app)
-  full = gzip.decompress(client.post("/valhalla.tgz", content=area).content)
+  full = tar_bytes(client.post(f"/valhalla.{ext}", content=area))
   last = max(manager.current_state.index.values(), key=lambda info: info["offset"])
   os.truncate(path, last["offset"] + 1)
-  response = client.post("/valhalla.tgz", content=area)
+  response = client.post(f"/valhalla.{ext}", content=area)
   assert response.status_code == 200
-  assert len(gzip.decompress(response.content)) == len(full) - (last["length"] - 1)
+  assert len(tar_bytes(response)) == len(full) - (last["length"] - 1)
 
 def test_verbose_logging(tmp_path, monkeypatch, capsys):
   """Verbose mode logs the archive load, each request and each archive built."""
@@ -396,12 +477,15 @@ def test_verbose_logging(tmp_path, monkeypatch, capsys):
   client = TestClient(vs.app)
   client.get("/valhalla+7-76-52.tgz")
   client.post("/valhalla.tgz", content=triangle_poly())
+  client.get("/valhalla+7-76-52.tar")
   out = capsys.readouterr().out
   assert "Streaming tgz request for z=7, x=76, y=52." in out
   assert "Streaming tgz request for a polygon." in out
+  assert "Streaming tar request for z=7, x=76, y=52." in out
   assert "Successfully streamed" in out
   assert '"GET /valhalla+7-76-52.tgz HTTP/1.1" 200' in out
   assert '"POST /valhalla.tgz HTTP/1.1" 200' in out
+  assert '"GET /valhalla+7-76-52.tar HTTP/1.1" 200' in out
 
 def test_reload_swaps_archive(tmp_path, capsys):
   """A reload serves the new archive and closes the old one once its last request is done."""

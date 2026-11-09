@@ -29,6 +29,9 @@ curl -o area.tgz "http://valhalla-slice:8000/valhalla.tgz?polygon=$(jq -sRr @uri
 curl -o area.tgz --data-binary @area.poly http://valhalla-slice:8000/valhalla.tgz
 ```
 
+### `/valhalla+{z}-{x}-{y}.tar` and `/valhalla.tar`
+Stream the same Valhalla TAR archive as the matching `.tgz` endpoint, uncompressed. They take the same arguments and return the same errors. The `Content-Length` header is computed from the index, so it is sent before any tile data is read.
+
 ### `/list`
 List the contents of the source Valhalla TAR archive. Mainly for debug purposes.
 
