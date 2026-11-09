@@ -496,6 +496,17 @@ def generate_tgz_stream(state, found_tiles, verbose=True):
       yield compressed_chunk
   yield compressor.flush()
 
+def tar_size(state, found_tiles):
+  """Returns the number of bytes generate_tar_stream yields for found_tiles."""
+  index_size = len(found_tiles) * 16
+  size = index_size + (512 - (index_size % 512)) % 512 + 1024
+  if has_index_header(state):
+    size += 512
+  for tile_id in found_tiles:
+    length = state.index[tile_id]["length"]
+    size += 512 + length + (512 - (length % 512)) % 512
+  return size
+
 def generate_list_stream(state):
   """Yields a text representation of the tar contents based on the index."""
   try:
@@ -570,16 +581,33 @@ def build_tgz_response(state, tile_ids, filename):
     headers={"Content-Length": str(total_size), "Content-Disposition": f"attachment; filename={filename}"},
   )
 
+def build_tar_response(state, tile_ids, filename):
+  """Returns the TAR archive of the indexed tiles among tile_ids as a download whose Content-Length is computed before any data is read."""
+  found_tiles = [t for t in tile_ids if t in state.index]
+  return StreamingResponse(
+    generate_tar_stream(state, found_tiles, state.verbose),
+    media_type="application/x-tar",
+    headers={"Content-Length": str(tar_size(state, found_tiles)), "Content-Disposition": f"attachment; filename={filename}"},
+  )
+
+def build_archive_response(state, tile_ids, filename):
+  """Returns the TAR archive for a .tar filename, otherwise the GZIP-compressed TAR archive."""
+  if filename.endswith(".tar"):
+    return build_tar_response(state, tile_ids, filename)
+  return build_tgz_response(state, tile_ids, filename)
+
 @app.get("/valhalla+{z}-{x}-{y}.tgz")
-def get_tgz(z: int, x: int, y: int):
-  """HTTP endpoint to stream the generated TAR archive compressed with GZIP."""
+@app.get("/valhalla+{z}-{x}-{y}.tar")
+def get_tgz(z: int, x: int, y: int, request: fastapi.Request):
+  """HTTP endpoint to stream the generated TAR archive, compressed with GZIP for .tgz."""
+  ext = request.url.path.rsplit(".", 1)[1]
   state = state_manager.get_state()
   tile_ids = get_valhalla_tile_ids(z, x, y)
   if state.verbose:
-    print(f"Streaming tgz request for z={z}, x={x}, y={y}. Requires {len(tile_ids)} tiles.")
-  return build_tgz_response(state, tile_ids, f"valhalla+{z}-{x}-{y}.tgz")
+    print(f"Streaming {ext} request for z={z}, x={x}, y={y}. Requires {len(tile_ids)} tiles.")
+  return build_archive_response(state, tile_ids, f"valhalla+{z}-{x}-{y}.{ext}")
 
-def polygon_response(text):
+def polygon_response(text, ext):
   """Returns the archive of the tiles covered by a GeoJSON or .poly polygon, or 400 when it does not parse."""
   try:
     polygons = parse_polygon(text)
@@ -588,10 +616,11 @@ def polygon_response(text):
   tile_ids = get_valhalla_tile_ids_polygon(polygons)
   state = state_manager.get_state()
   if state.verbose:
-    print(f"Streaming tgz request for a polygon. Requires {len(tile_ids)} tiles.")
-  return build_tgz_response(state, tile_ids, "valhalla.tgz")
+    print(f"Streaming {ext} request for a polygon. Requires {len(tile_ids)} tiles.")
+  return build_archive_response(state, tile_ids, f"valhalla.{ext}")
 
 @app.get("/valhalla.tgz")
+@app.get("/valhalla.tar")
 def get_polygon_tgz(request: fastapi.Request):
   """HTTP endpoint for the archive of the tiles covered by the URL-encoded polygon parameter."""
   polygons = request.query_params.getlist("polygon")
@@ -599,9 +628,10 @@ def get_polygon_tgz(request: fastapi.Request):
     return PlainTextResponse("polygon given more than once\n", status_code=400)
   if not polygons or not polygons[0].strip():
     return PlainTextResponse("missing polygon\n", status_code=400)
-  return polygon_response(polygons[0])
+  return polygon_response(polygons[0], request.url.path.rsplit(".", 1)[1])
 
 @app.post("/valhalla.tgz")
+@app.post("/valhalla.tar")
 async def post_polygon_tgz(request: fastapi.Request):
   """HTTP endpoint for the archive of the tiles covered by the polygon in the raw request body."""
   if "polygon" in request.query_params:
@@ -617,7 +647,7 @@ async def post_polygon_tgz(request: fastapi.Request):
     return PlainTextResponse("polygon is not UTF-8 text\n", status_code=400)
   if not text.strip():
     return PlainTextResponse("missing polygon\n", status_code=400)
-  return await run_in_threadpool(polygon_response, text)
+  return await run_in_threadpool(polygon_response, text, request.url.path.rsplit(".", 1)[1])
 
 @app.get("/list")
 def list_tar():
