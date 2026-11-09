@@ -326,17 +326,21 @@ def test_tar_endpoints(service, method, name, params, body):
   assert read_tar(tar_response.content) == read_tgz(tgz_response.content)
 
 def test_tar_streams_before_second_tile(service, monkeypatch):
-  """The .tar response sends its Content-Length and first byte before the second tile's header or data is read."""
+  """The .tar response sends its Content-Length and first byte before the second tile's header or data is read, and stops there."""
   state = vs.state_manager.current_state
   found_tiles = [t for t in vs.get_valhalla_tile_ids(7, 76, 52) if t in state.index]
   second_offset = state.index[found_tiles[1]]["offset"]
   events = []
   real_pread = os.pread
 
+  class SecondTileRead(Exception):
+    """Ends the response at the first read of the second tile."""
+
   def recording_pread(fd, length, offset):
-    """Records the first read of the second tile's header or data."""
-    if offset in (second_offset - 512, second_offset) and "second tile read" not in events:
+    """Records the first read of the second tile's header or data and ends the response there."""
+    if offset in (second_offset - 512, second_offset):
       events.append("second tile read")
+      raise SecondTileRead()
     return real_pread(fd, length, offset)
 
   async def receive():
@@ -351,7 +355,8 @@ def test_tar_streams_before_second_tile(service, monkeypatch):
       events.append("first byte")
   monkeypatch.setattr(vs.os, "pread", recording_pread)
   scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": "2.4"}, "http_version": "1.1", "method": "GET", "scheme": "http", "path": "/valhalla+7-76-52.tar", "raw_path": b"/valhalla+7-76-52.tar", "root_path": "", "query_string": b"", "headers": [], "client": None, "server": ("testserver", 80)}
-  anyio.run(vs.app, scope, receive, send)
+  with pytest.raises(SecondTileRead):
+    anyio.run(vs.app, scope, receive, send)
   assert len(found_tiles) > 1
   assert events == [("start", str(vs.tar_size(state, found_tiles)).encode()), "first byte", "second tile read"]
 
