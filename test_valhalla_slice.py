@@ -325,18 +325,18 @@ def test_tar_endpoints(service, method, name, params, body):
   assert int(tar_response.headers["content-length"]) == len(tar_response.content)
   assert read_tar(tar_response.content) == read_tgz(tgz_response.content)
 
-def test_tar_streams_before_last_tile(service, monkeypatch):
-  """The .tar response sends its Content-Length and first byte before the last tile's data is read."""
+def test_tar_streams_before_second_tile(service, monkeypatch):
+  """The .tar response sends its Content-Length and first byte before the second tile's header or data is read."""
   state = vs.state_manager.current_state
   found_tiles = [t for t in vs.get_valhalla_tile_ids(7, 76, 52) if t in state.index]
-  last_offset = state.index[found_tiles[-1]]["offset"]
+  second_offset = state.index[found_tiles[1]]["offset"]
   events = []
   real_pread = os.pread
 
   def recording_pread(fd, length, offset):
-    """Records the read of the last tile's data."""
-    if offset == last_offset:
-      events.append("last tile read")
+    """Records the first read of the second tile's header or data."""
+    if offset in (second_offset - 512, second_offset) and "second tile read" not in events:
+      events.append("second tile read")
     return real_pread(fd, length, offset)
 
   async def receive():
@@ -353,7 +353,7 @@ def test_tar_streams_before_last_tile(service, monkeypatch):
   scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": "2.4"}, "http_version": "1.1", "method": "GET", "scheme": "http", "path": "/valhalla+7-76-52.tar", "raw_path": b"/valhalla+7-76-52.tar", "root_path": "", "query_string": b"", "headers": [], "client": None, "server": ("testserver", 80)}
   anyio.run(vs.app, scope, receive, send)
   assert len(found_tiles) > 1
-  assert events == [("start", str(vs.tar_size(state, found_tiles)).encode()), "first byte", "last tile read"]
+  assert events == [("start", str(vs.tar_size(state, found_tiles)).encode()), "first byte", "second tile read"]
 
 @pytest.mark.parametrize("lengths", [[], [0], [512, 1024], [511, 512, 513], [100] * 32, [1] * 33])
 def test_tar_size(tmp_path, lengths):
