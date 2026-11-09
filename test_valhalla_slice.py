@@ -118,11 +118,12 @@ def add_member(tar, name, data, mtime=TILE_MTIME):
   info.mtime = mtime
   tar.addfile(info, io.BytesIO(data))
 
-def build_archive(path, tile_ids, with_index=True, large_mtime_tile=None):
-  """Writes a Valhalla tile archive: index.bin followed by one .gph member per tile; returns the tile contents."""
-  contents = {}
-  for tile_id in tile_ids:
-    contents[tile_id] = tile_id.to_bytes(4, "little") * ((tile_id % 300) + 1)
+def build_archive(path, tile_ids, with_index=True, large_mtime_tile=None, contents=None):
+  """Writes a Valhalla tile archive: index.bin followed by one .gph member per tile, with generated or given contents; returns the tile contents."""
+  if contents is None:
+    contents = {}
+    for tile_id in tile_ids:
+      contents[tile_id] = tile_id.to_bytes(4, "little") * ((tile_id % 300) + 1)
   paths = {vs.get_tile_path(t): t for t in tile_ids}
   offsets = {t: 0 for t in tile_ids}
   tar_format = tarfile.GNU_FORMAT if large_mtime_tile else tarfile.USTAR_FORMAT
@@ -152,6 +153,12 @@ def read_tar(raw):
 def read_tgz(data):
   """Returns the members of a .tgz response, checking that index.bin points at each tile's data."""
   return read_tar(gzip.decompress(data))
+
+def tar_bytes(response):
+  """Returns the uncompressed TAR archive of a .tar or .tgz response."""
+  if response.headers["content-type"] == "application/gzip":
+    return gzip.decompress(response.content)
+  return response.content
 
 @pytest.fixture(scope="module")
 def service(tmp_path_factory):
@@ -317,6 +324,19 @@ def test_tar_endpoints(service, method, name, params, body):
   assert int(tar_response.headers["content-length"]) == len(tar_response.content)
   assert read_tar(tar_response.content) == read_tgz(tgz_response.content)
 
+@pytest.mark.parametrize("lengths", [[], [0], [512, 1024], [511, 512, 513], [100] * 32, [1] * 33])
+def test_tar_size(tmp_path, lengths):
+  """tar_size is the number of bytes generate_tar_stream yields, whether or not the tiles and index.bin need padding."""
+  tile_ids = archive_tile_ids()[:len(lengths)]
+  path = str(tmp_path / "valhalla_tiles.tar")
+  build_archive(path, tile_ids, contents={t: b"x" * n for t, n in zip(tile_ids, lengths)})
+  state = vs.ArchiveState(path, verbose=False)
+  state.acquire()
+  size = vs.tar_size(state, tile_ids)
+  assert size == len(b"".join(vs.generate_tar_stream(state, tile_ids, verbose=False)))
+  state.fd.close()
+
+@pytest.mark.parametrize("ext", ["tgz", "tar"])
 @pytest.mark.parametrize("method,url,body,status", [
   ("GET", "/valhalla.tgz", None, 400),
   ("GET", "/valhalla.tgz?polygon=", None, 400),
@@ -327,34 +347,34 @@ def test_tar_endpoints(service, method, name, params, body):
   ("POST", "/valhalla.tgz", b"\xff\xfe", 400),
   ("POST", "/valhalla.tgz?polygon=x", square_poly().encode(), 400),
   ("POST", "/valhalla.tgz", b"name\n1\n0 0\n", 400),
-  ("GET", "/valhalla.tar", None, 400),
-  ("POST", "/valhalla.tar", b"", 400),
 ])
-def test_http_errors(service, method, url, body, status):
+def test_http_errors(service, ext, method, url, body, status):
   """Missing, repeated, misplaced and invalid polygons are rejected."""
-  response = service[0].request(method, url, content=body)
+  response = service[0].request(method, url.replace(".tgz", f".{ext}"), content=body)
   assert response.status_code == status
 
-def test_post_too_large(service, monkeypatch):
+@pytest.mark.parametrize("ext", ["tgz", "tar"])
+def test_post_too_large(service, monkeypatch, ext):
   """A body over MAX_POLYGON_BYTES is rejected with 413."""
   monkeypatch.setattr(vs, "MAX_POLYGON_BYTES", 10)
-  response = service[0].post("/valhalla.tgz", content=square_poly())
+  response = service[0].post(f"/valhalla.{ext}", content=square_poly())
   assert response.status_code == 413
 
-def read_tgz_infos(data):
-  """Returns the TarInfo of each member of a .tgz response by name."""
-  with tarfile.open(fileobj=io.BytesIO(gzip.decompress(data))) as tar:
+def read_tar_infos(raw):
+  """Returns the TarInfo of each member of an uncompressed archive by name."""
+  with tarfile.open(fileobj=io.BytesIO(raw)) as tar:
     return {m.name: m for m in tar.getmembers()}
 
 def list_date(mtime):
   """Formats a modification time as the /list endpoint does."""
   return time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime))
 
-def test_archive_header_times(service):
+@pytest.mark.parametrize("ext", ["tgz", "tar"])
+def test_archive_header_times(service, ext):
   """Tiles keep the mtime of their original headers and the generated index.bin gets the current time."""
   start = int(time.time())
-  response = service[0].get("/valhalla+7-76-52.tgz")
-  infos = read_tgz_infos(response.content)
+  response = service[0].get(f"/valhalla+7-76-52.{ext}")
+  infos = read_tar_infos(tar_bytes(response))
   assert start <= infos["index.bin"].mtime <= int(time.time())
   assert infos["index.bin"].size == 16 * (len(infos) - 1)
   assert all(info.mtime == TILE_MTIME for name, info in infos.items() if name != "index.bin")
@@ -394,7 +414,8 @@ def test_archive_without_index(tmp_path, monkeypatch, capsys):
   assert response.content == b"\0" * 1024
   assert response.headers["content-length"] == "1024"
 
-def test_truncated_tile_data(tmp_path, monkeypatch):
+@pytest.mark.parametrize("ext", ["tgz", "tar"])
+def test_truncated_tile_data(tmp_path, monkeypatch, ext):
   """A tile whose data was cut off after loading ends its data early instead of hanging."""
   path = str(tmp_path / "valhalla_tiles.tar")
   build_archive(path, archive_tile_ids())
@@ -402,12 +423,12 @@ def test_truncated_tile_data(tmp_path, monkeypatch):
   monkeypatch.setattr(vs, "state_manager", manager)
   area = "\n".join(["area", "1", f"{ARCHIVE_AREA[0]} {ARCHIVE_AREA[1]}", f"{ARCHIVE_AREA[2]} {ARCHIVE_AREA[1]}", f"{ARCHIVE_AREA[2]} {ARCHIVE_AREA[3]}", f"{ARCHIVE_AREA[0]} {ARCHIVE_AREA[3]}", "END", "END"])
   client = TestClient(vs.app)
-  full = gzip.decompress(client.post("/valhalla.tgz", content=area).content)
+  full = tar_bytes(client.post(f"/valhalla.{ext}", content=area))
   last = max(manager.current_state.index.values(), key=lambda info: info["offset"])
   os.truncate(path, last["offset"] + 1)
-  response = client.post("/valhalla.tgz", content=area)
+  response = client.post(f"/valhalla.{ext}", content=area)
   assert response.status_code == 200
-  assert len(gzip.decompress(response.content)) == len(full) - (last["length"] - 1)
+  assert len(tar_bytes(response)) == len(full) - (last["length"] - 1)
 
 def test_verbose_logging(tmp_path, monkeypatch, capsys):
   """Verbose mode logs the archive load, each request and each archive built."""
@@ -428,6 +449,7 @@ def test_verbose_logging(tmp_path, monkeypatch, capsys):
   assert "Successfully streamed" in out
   assert '"GET /valhalla+7-76-52.tgz HTTP/1.1" 200' in out
   assert '"POST /valhalla.tgz HTTP/1.1" 200' in out
+  assert '"GET /valhalla+7-76-52.tar HTTP/1.1" 200' in out
 
 def test_reload_swaps_archive(tmp_path, capsys):
   """A reload serves the new archive and closes the old one once its last request is done."""
